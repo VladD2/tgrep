@@ -132,10 +132,23 @@ const RECONCILE_DEADLINE: Duration = Duration::from_secs(4 * 3600);
 /// the window, so a burst of saves collapses into one reindex pass; a search
 /// that arrives inside the window applies the pending paths synchronously and
 /// never waits for it at all.
+///
+/// This is only the second of two debounce layers. A reporting client (an
+/// editor plugin) typically waits its own ≈2 s quiet window before notifying,
+/// so the worst case with no search is ≈2 s + this ≈10 s ≈ 12 s; a search that
+/// arrives first applies the paths immediately.
 const PENDING_FLUSH_DEBOUNCE: Duration = Duration::from_secs(10);
 
-/// How often the pending-flush loop wakes to check its debounce deadline.
-const PENDING_FLUSH_POLL: Duration = Duration::from_millis(100);
+/// The TCP listener's bind address.
+///
+/// Bind to loopback only: this endpoint can trigger reindex of arbitrary files
+/// under root, so it must never be exposed on 0.0.0.0.
+const SERVE_BIND_ADDR: &str = "127.0.0.1";
+
+/// Largest `params.paths` array the `notify` method will accept. A single
+/// request that reindexes this many files would pin the snapshot gate and the
+/// reader for the whole burst, so it is rejected up front rather than queued.
+const MAX_NOTIFY_PATHS: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum WatchMode {
@@ -467,11 +480,15 @@ impl RecentReindexCache {
 /// report a write at all, and even a native event can land after a search has
 /// already run against the stale index. The server applies the reported paths
 /// before the next search, and — when no search arrives — once the debounce
-/// window elapses without a new notification.
+/// window elapses without a new notification. That window is the second of two
+/// debounce layers: the reporting client typically adds its own ≈2 s quiet
+/// window before notifying, so the worst case without a search is ≈12 s.
 #[derive(Default)]
 struct PendingChanges {
     /// Index-relative paths, deduplicated, in notification order.
     paths: Vec<String>,
+    /// Membership mirror of `paths` for O(1) dedup; always matches the Vec.
+    known: std::collections::HashSet<String>,
     /// When the debounce window elapses; `None` while the list is empty.
     /// Every notification restarts it.
     due: Option<Instant>,
@@ -741,22 +758,26 @@ impl ServerState {
     }
 
     /// Record client-notified paths and restart the debounce window.
-    /// Returns the total number of pending paths.
-    fn note_pending_changes(&self, paths: &[String]) -> usize {
+    /// Returns `(added, total)`: how many unique paths were newly added by
+    /// this call and the total number of distinct paths now pending.
+    fn note_pending_changes(&self, paths: &[String]) -> (usize, usize) {
         let mut pending = self.pending_changes.lock().unwrap();
+        let mut added = 0;
         for path in paths {
-            if !pending.paths.contains(path) {
+            if pending.known.insert(path.clone()) {
                 pending.paths.push(path.clone());
+                added += 1;
             }
         }
         pending.due = Some(Instant::now() + PENDING_FLUSH_DEBOUNCE);
-        pending.paths.len()
+        (added, pending.paths.len())
     }
 
     /// Take the pending paths unconditionally, clearing the debounce window.
     fn take_pending_changes(&self) -> Vec<String> {
         let mut pending = self.pending_changes.lock().unwrap();
         pending.due = None;
+        pending.known.clear();
         std::mem::take(&mut pending.paths)
     }
 
@@ -766,10 +787,17 @@ impl ServerState {
         let mut pending = self.pending_changes.lock().unwrap();
         if pending.due.is_some_and(|due| due <= Instant::now()) {
             pending.due = None;
+            pending.known.clear();
             std::mem::take(&mut pending.paths)
         } else {
             Vec::new()
         }
+    }
+
+    /// The pending list's debounce deadline, if any, so the flush loop can
+    /// sleep until it instead of polling on a fixed cadence.
+    fn pending_flush_deadline(&self) -> Option<Instant> {
+        self.pending_changes.lock().unwrap().due
     }
 }
 
@@ -993,8 +1021,10 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         stale_refresh_hook: Mutex::new(None),
     });
 
-    // Bind TCP listener on a random port
-    let listener = TcpListener::bind("127.0.0.1:0")?;
+    // Bind TCP listener on a random loopback port. Loopback only (see
+    // `SERVE_BIND_ADDR`): the endpoint can trigger reindex of arbitrary files
+    // under root, so it must never be exposed on 0.0.0.0.
+    let listener = TcpListener::bind(format!("{SERVE_BIND_ADDR}:0"))?;
     let port = listener.local_addr()?.port();
 
     // Write server info
@@ -1497,6 +1527,16 @@ fn handle_notify(
     let Some(raw_paths) = params.get("paths").and_then(|p| p.as_array()) else {
         return json_rpc_error(id, -32602, "params.paths must be an array of index-relative paths");
     };
+    if raw_paths.len() > MAX_NOTIFY_PATHS {
+        return json_rpc_error(
+            id,
+            -32602,
+            &format!(
+                "params.paths has {} entries; the limit is {MAX_NOTIFY_PATHS}",
+                raw_paths.len()
+            ),
+        );
+    }
     let mut paths = Vec::with_capacity(raw_paths.len());
     for path in raw_paths {
         let Some(path) = path.as_str() else {
@@ -1512,17 +1552,15 @@ fn handle_notify(
         }
         paths.push(path.to_string());
     }
-    let pending = state.note_pending_changes(&paths);
+    let (queued, pending) = state.note_pending_changes(&paths);
     eprintln!(
-        "[trace] notify: {} path(s) queued, {} pending, debounce {}s",
-        paths.len(),
-        pending,
+        "[trace] notify: {queued} path(s) queued, {pending} pending, debounce {}s",
         PENDING_FLUSH_DEBOUNCE.as_secs()
     );
     json_rpc_result(
         id,
         serde_json::json!({
-            "queued": paths.len(),
+            "queued": queued,
             "pending": pending,
             "debounce_secs": PENDING_FLUSH_DEBOUNCE.as_secs(),
         }),
@@ -1862,15 +1900,15 @@ fn handle_search(
     // rather than walking the tree underneath a client that is mid-session.
     state.note_search();
 
-    // A client may have notified changes that are still pending: apply them
-    // now, before reading the index, so this search runs against the updated
-    // files rather than the ones they replaced.
-    flush_notified_changes(state);
-
     let req = match parse_search_params(params) {
         Ok(r) => r,
         Err(e) => return json_rpc_error(id, -32602, &e),
     };
+
+    // A client may have notified changes that are still pending: apply them
+    // only after the request has parsed, so an invalid search neither flushes
+    // the pending list nor reindexes anything it will not actually search.
+    flush_notified_changes(state);
 
     let matcher = req.matcher;
     let plan = req.plan;
@@ -2520,7 +2558,7 @@ fn flush_pending_changes(state: &Arc<ServerState>, paths: Vec<String>) {
     if state.indexing.load(Ordering::SeqCst) {
         let mut pending = state.pending_changes.lock().unwrap();
         for path in paths {
-            if !pending.paths.contains(&path) {
+            if pending.known.insert(path.clone()) {
                 pending.paths.push(path);
             }
         }
@@ -2554,10 +2592,18 @@ fn flush_pending_changes(state: &Arc<ServerState>, paths: Vec<String>) {
 
 /// Reindex client-notified files once their debounce window elapses without a
 /// new notification. A search flushes the same list earlier, so this only
-/// does work when nobody is asking.
+/// does work when nobody is asking. The thread sleeps until the debounce
+/// deadline (capped at one second) rather than polling on a fixed cadence, so
+/// an idle server costs no wake-ups yet a just-added notification is picked up
+/// within a second even if the deadline was set before this read.
 fn pending_flush_loop(state: Arc<ServerState>) {
+    const MAX_WAIT: Duration = Duration::from_secs(1);
     loop {
-        thread::sleep(PENDING_FLUSH_POLL);
+        let wait = state
+            .pending_flush_deadline()
+            .map(|due| due.saturating_duration_since(Instant::now()).min(MAX_WAIT))
+            .unwrap_or(MAX_WAIT);
+        thread::sleep(wait);
         let paths = state.take_due_pending_changes();
         if !paths.is_empty() {
             flush_pending_changes(&state, paths);
@@ -8627,6 +8673,14 @@ mod tests {
             paths: paths.iter().map(PathBuf::from).collect(),
             attrs: Default::default(),
         }
+    }
+
+    #[test]
+    fn serve_bind_address_is_loopback_only() {
+        // The endpoint can reindex arbitrary files under root, so it must bind
+        // to loopback and never to 0.0.0.0.
+        let ip: std::net::IpAddr = SERVE_BIND_ADDR.parse().expect("bind addr is an IP");
+        assert!(ip.is_loopback(), "expected a loopback bind address, got {ip}");
     }
 
     #[test]

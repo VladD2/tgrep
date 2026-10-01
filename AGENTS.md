@@ -67,7 +67,10 @@ tgrep status .
 If your agent framework cannot keep a background process alive, skip `serve`
 and run `tgrep index .` instead. Searches then use the on-disk index. That
 index is not updated by searches or edits, so re-run `tgrep index .` after any
-change a later search has to see, including your own edits.
+change a later search has to see, including your own edits. That manual
+reindex is only the no-server fallback: with a running `tgrep serve`, edits
+reach the index through the file watcher or an explicit `tgrep notify` (see
+Freshness for the timing).
 
 ## Searching
 
@@ -186,6 +189,10 @@ legacy-format support for migration.
   worker has processed. Events are queued and applied asynchronously, so a
   search issued right after an edit can run before the index has caught up.
   Use `--no-index` when the very latest edit must be visible.
+- `tgrep notify <root> <files>` tells a running server which files changed,
+  for filesystems whose native events it cannot rely on. The change is applied
+  immediately before the next search, or — with no search — after the
+  plugin's ≈2 s quiet window plus the server's ≈10 s debounce, up to ≈12 s.
 - With only an **on-disk index**, results reflect the last `tgrep index`.
   Files created since then are not found. Run `tgrep index .` again, or
   start `tgrep serve .`.

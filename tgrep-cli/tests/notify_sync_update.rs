@@ -25,11 +25,25 @@
 //!      window restarted by the second notification has not elapsed 10 s after
 //!      the first, so both are still pending; a search then sees both files
 //!      (the flush ran synchronously, before the search).
+//!   5. Delete: a file is notified and searchable, deleted from disk and
+//!      notified again — the server drops it from the index and the drop is
+//!      stable on repeat.
+//!   6. Rename: a rename is delete(old) + add(new); one notification carrying
+//!      both paths converges the index — the old name is gone, the new name
+//!      has the new content.
+//!   7. Lexical normalisation of deleted paths: `./x` and `sub/../sub/x`
+//!      notify a file that no longer exists — the CLI folds the path text
+//!      without the filesystem and the server drops the file.
+//!   8. Path cap: a `notify` with 100_001 paths is rejected with JSON-RPC
+//!      error -32602 before any filesystem access, and the server keeps
+//!      serving the next notify.
+//!   9. Queued semantics: the same path listed twice in one notify is
+//!      deduplicated — `result.queued` and `result.pending` are both 1.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::{Path, PathBuf, MAIN_SEPARATOR};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -130,6 +144,29 @@ fn pending_count(port: u16) -> u64 {
         .pointer("/result/pending_changes")
         .and_then(|v| v.as_u64())
         .unwrap_or_else(|| panic!("missing pending_changes in response: {response}"))
+}
+
+/// Poll the pending count until it reaches `expected` (typically 0 after the
+/// debounce flush), checking every 500 ms for up to 20 s.
+///
+/// A fixed sleep followed by an assert is a flake source: the flush is due
+/// ~10 s after the last notification, but the flush thread can be late by more
+/// than a fixed margin under load, and the assert then fails even though the
+/// flush is on its way. Polling gives the flush its whole window plus slack
+/// and only burns the extra time when the server is actually broken.
+fn wait_for_pending_count(port: u16, expected: u64, serve_log: &Path) {
+    let start = Instant::now();
+    loop {
+        if pending_count(port) == expected {
+            return;
+        }
+        assert!(
+            start.elapsed() <= Duration::from_secs(20),
+            "pending count did not reach {expected} within 20 seconds; log:\n{}",
+            fs::read_to_string(serve_log).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
 }
 
 fn wait_for_port(index_dir: &Path) -> u16 {
@@ -249,13 +286,7 @@ fn notify_emulates_plugin_updates() {
     write_file(root, "a.txt", "gamma\n");
     notify_files(root, index_dir, &["a.txt"]);
     assert_eq!(pending_count(port), 1, "the notified path must be pending");
-    thread::sleep(Duration::from_secs(12));
-    assert_eq!(
-        pending_count(port),
-        0,
-        "the background debounce must have flushed the list; log:\n{}",
-        fs::read_to_string(&serve_log).unwrap_or_default()
-    );
+    wait_for_pending_count(port, 0, &serve_log);
     assert_eq!(search_files(root, index_dir, "gamma"), vec!["a.txt"]);
     assert_eq!(search_files(root, index_dir, "beta"), Vec::<String>::new());
     // Stable on repeat.
@@ -288,4 +319,156 @@ fn notify_emulates_plugin_updates() {
     // Stable on repeat.
     assert_eq!(search_files(root, index_dir, "one"), vec!["a.txt"]);
     assert_eq!(search_files(root, index_dir, "two"), vec!["b.txt"]);
+
+    // ── Delete: notifying a path that is gone drops it from the index ─────
+    // The plugin saved `d.txt`, then the file was deleted. The index was
+    // built without it, so the first notification adds it; the second one,
+    // after the delete, must remove it.
+    write_file(root, "d.txt", "delete-me\n");
+    notify_files(root, index_dir, &["d.txt"]);
+    assert_eq!(search_files(root, index_dir, "delete-me"), vec!["d.txt"]);
+    assert_eq!(pending_count(port), 0);
+    fs::remove_file(root.join("d.txt")).unwrap();
+    notify_files(root, index_dir, &["d.txt"]);
+    assert_eq!(search_files(root, index_dir, "delete-me"), Vec::<String>::new());
+    assert_eq!(pending_count(port), 0);
+    // Stable on repeat.
+    assert_eq!(search_files(root, index_dir, "delete-me"), Vec::<String>::new());
+
+    // ── Rename: delete(old) + add(new) in one notification ────────────────
+    // There is no special rename support: notifying both paths in one call
+    // converges the index — the old name is gone, the new name has the new
+    // content.
+    write_file(root, "r1.txt", "old-name-here\n");
+    notify_files(root, index_dir, &["r1.txt"]);
+    assert_eq!(search_files(root, index_dir, "old-name-here"), vec!["r1.txt"]);
+    fs::rename(root.join("r1.txt"), root.join("r2.txt")).unwrap();
+    write_file(root, "r2.txt", "new-name-here\n");
+    notify_files(root, index_dir, &["r1.txt", "r2.txt"]);
+    assert_eq!(search_files(root, index_dir, "old-name-here"), Vec::<String>::new());
+    assert_eq!(search_files(root, index_dir, "new-name-here"), vec!["r2.txt"]);
+    assert_eq!(pending_count(port), 0);
+    // Stable on repeat.
+    assert_eq!(search_files(root, index_dir, "old-name-here"), Vec::<String>::new());
+    assert_eq!(search_files(root, index_dir, "new-name-here"), vec!["r2.txt"]);
+
+    // ── Lexical normalisation of a deleted path ────────────────────────────
+    // The file is gone, so `canonicalize` cannot run; the CLI folds `.`,
+    // `..` and duplicate separators in the path text instead.
+    write_file(root, "lex.txt", "lex-content\n");
+    notify_files(root, index_dir, &["lex.txt"]);
+    assert_eq!(search_files(root, index_dir, "lex-content"), vec!["lex.txt"]);
+    fs::remove_file(root.join("lex.txt")).unwrap();
+    let output = run_tgrep(
+        root,
+        &[
+            "notify",
+            root.to_str().unwrap(),
+            "./lex.txt",
+            "--no-require-git",
+            "--index-path",
+            index_dir.to_str().unwrap(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "dot-relative notify of a deleted file failed: {stderr}"
+    );
+    assert!(!stderr.contains("invalid path"), "unexpected invalid path: {stderr}");
+    assert_eq!(search_files(root, index_dir, "lex-content"), Vec::<String>::new());
+
+    write_file(root, "lex2.txt", "lex2-content\n");
+    notify_files(root, index_dir, &["lex2.txt"]);
+    assert_eq!(search_files(root, index_dir, "lex2-content"), vec!["lex2.txt"]);
+    fs::remove_file(root.join("lex2.txt")).unwrap();
+
+    // A `..`-folding path needs a directory to fold back through, so the
+    // second case lives in a subdirectory: `sub/../sub/lex3.txt` folds to
+    // `sub/lex3.txt`.
+    fs::create_dir(root.join("sub")).unwrap();
+    write_file(root, "sub/lex3.txt", "lex3-content\n");
+    notify_files(root, index_dir, &["sub/lex3.txt"]);
+    // The search CLI renders nested paths with the native separator.
+    let lex3_display = format!("sub{MAIN_SEPARATOR}lex3.txt");
+    assert_eq!(search_files(root, index_dir, "lex3-content"), vec![lex3_display]);
+    fs::remove_file(root.join("sub").join("lex3.txt")).unwrap();
+    let output = run_tgrep(
+        root,
+        &[
+            "notify",
+            root.to_str().unwrap(),
+            "sub/../sub/lex3.txt",
+            "--no-require-git",
+            "--index-path",
+            index_dir.to_str().unwrap(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "dot-parent notify of a deleted file failed: {stderr}"
+    );
+    assert!(!stderr.contains("invalid path"), "unexpected invalid path: {stderr}");
+    assert_eq!(search_files(root, index_dir, "lex3-content"), Vec::<String>::new());
+
+    // ── Path cap: an oversized notify is rejected before filesystem access ─
+    // 100_001 paths exceed the server's limit; the entries need not exist,
+    // the check happens up front. The server must keep serving afterwards.
+    let mut paths_json = String::with_capacity(100_001 * 16);
+    for i in 0..100_001 {
+        if i > 0 {
+            paths_json.push(',');
+        }
+        paths_json.push_str(&format!("\"limit-{i}.txt\""));
+    }
+    let response = send_request(
+        port,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"notify\",\"params\":{{\"paths\":[{paths_json}]}}}}"
+        ),
+    )
+    .expect("over-limit notify request failed");
+    let value: serde_json::Value = serde_json::from_str(&response).expect("invalid JSON response");
+    assert_eq!(
+        value.pointer("/error/code").and_then(|v| v.as_i64()),
+        Some(-32602),
+        "the over-limit notify must be rejected with -32602, got: {response}"
+    );
+    // The server is still healthy: a small valid notify is accepted and a
+    // search flushes it as usual.
+    let response = send_request(
+        port,
+        r#"{"jsonrpc":"2.0","id":2,"method":"notify","params":{"paths":["a.txt"]}}"#,
+    )
+    .expect("follow-up notify request failed");
+    let value: serde_json::Value = serde_json::from_str(&response).expect("invalid JSON response");
+    assert_eq!(
+        value.pointer("/result/queued").and_then(|v| v.as_u64()),
+        Some(1),
+        "the follow-up notify must be accepted, got: {response}"
+    );
+    assert_eq!(search_files(root, index_dir, "one"), vec!["a.txt"]);
+    assert_eq!(pending_count(port), 0);
+
+    // ── Queued semantics: duplicates within one notify are counted once ────
+    assert_eq!(pending_count(port), 0);
+    let response = send_request(
+        port,
+        r#"{"jsonrpc":"2.0","id":3,"method":"notify","params":{"paths":["a.txt","a.txt"]}}"#,
+    )
+    .expect("duplicate notify request failed");
+    let value: serde_json::Value = serde_json::from_str(&response).expect("invalid JSON response");
+    assert_eq!(
+        value.pointer("/result/queued").and_then(|v| v.as_u64()),
+        Some(1),
+        "a duplicate path must be queued once, got: {response}"
+    );
+    assert_eq!(
+        value.pointer("/result/pending").and_then(|v| v.as_u64()),
+        Some(1),
+        "a duplicate path must be pending once, got: {response}"
+    );
+    assert_eq!(search_files(root, index_dir, "one"), vec!["a.txt"]);
+    assert_eq!(pending_count(port), 0);
 }

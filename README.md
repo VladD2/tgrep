@@ -26,10 +26,12 @@ the server when available, then the local index, or scan the filesystem if no
 usable index exists. Indexes are stored in `.tgrep/` by default; add this
 directory to `.gitignore`.
 
-**Indexes can lag filesystem changes.** The server updates asynchronously;
-without a server, rerun `tgrep index .` after changes. Use `--no-index` when a
-search must read the current files. Queries scan during an initial build until
-complete coverage is available.
+**Indexes can lag filesystem changes.** The server updates asynchronously. A
+search applies any pending `tgrep notify` changes immediately; with no search
+they land after the reporting plugin's ≈2 s quiet window plus the server's
+≈10 s debounce, up to ≈12 s. Without a server, rerun `tgrep index .` after
+changes. Use `--no-index` when a search must read the current files. Queries
+scan during an initial build until complete coverage is available.
 
 For coding agents, see [AGENTS.md](AGENTS.md). To install MCP search tools and
 startup hooks for Codex or pi, run `bash install-agent.sh` from this checkout
