@@ -10,6 +10,7 @@ mod glob_filter;
 mod index;
 mod matching;
 mod mem;
+mod notify;
 mod output;
 mod search;
 mod serve;
@@ -710,6 +711,21 @@ enum Command {
         path: PathBuf,
     },
 
+    /// Tell the running search server which files changed.
+    ///
+    /// The server applies the changes to its index before the next search and,
+    /// when no search arrives, after a short debounce. Relative paths are
+    /// resolved against ROOT; the server is located through the index
+    /// directory, as `search` finds it.
+    Notify {
+        /// Root directory the server serves.
+        path: PathBuf,
+
+        /// Changed files, absolute or relative to the root.
+        #[arg(required = true, value_name = "FILE")]
+        files: Vec<PathBuf>,
+    },
+
     /// Count text files in a directory (fast walker, no indexing).
     CountFiles {
         /// Root directory to scan.
@@ -1184,6 +1200,7 @@ fn run_cli() {
             run_search(&cli, pattern, &paths, &resolved)
         }
         Some(Command::Status { path }) => status::run(&path, cli.index_path.as_deref()),
+        Some(Command::Notify { path, files }) => notify::run(&path, cli.index_path.as_deref(), &files),
         Some(Command::CountFiles { path }) => walkcount::run(&path, cli.hidden, no_ignore),
         None => {
             if cli.list_files {

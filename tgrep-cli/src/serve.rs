@@ -127,6 +127,16 @@ const RECONCILE_QUIET_PERIOD: Duration = Duration::from_secs(120);
 /// never reconcile at all — which is the failure this exists to prevent.
 const RECONCILE_DEADLINE: Duration = Duration::from_secs(4 * 3600);
 
+/// How long a client-notified change waits before the pending-flush loop
+/// reindexes it, when no search arrives first. Every new notification restarts
+/// the window, so a burst of saves collapses into one reindex pass; a search
+/// that arrives inside the window applies the pending paths synchronously and
+/// never waits for it at all.
+const PENDING_FLUSH_DEBOUNCE: Duration = Duration::from_secs(10);
+
+/// How often the pending-flush loop wakes to check its debounce deadline.
+const PENDING_FLUSH_POLL: Duration = Duration::from_millis(100);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum WatchMode {
     #[default]
@@ -449,6 +459,24 @@ impl RecentReindexCache {
     }
 }
 
+/// Client-notified file changes awaiting reindex.
+///
+/// A client (an editor plugin, or any other writer that knows exactly which
+/// files it touched) reports those paths with the `notify` method instead of
+/// relying on the watcher: a virtualised or networked filesystem may not
+/// report a write at all, and even a native event can land after a search has
+/// already run against the stale index. The server applies the reported paths
+/// before the next search, and — when no search arrives — once the debounce
+/// window elapses without a new notification.
+#[derive(Default)]
+struct PendingChanges {
+    /// Index-relative paths, deduplicated, in notification order.
+    paths: Vec<String>,
+    /// When the debounce window elapses; `None` while the list is empty.
+    /// Every notification restarts it.
+    due: Option<Instant>,
+}
+
 struct ServerState {
     index: RwLock<HybridIndex>,
     /// Read under the index lock so visibility and content change together at
@@ -675,6 +703,9 @@ struct ServerState {
     /// Milliseconds since `started` at the last search request, used by the
     /// periodic reconcile to stay out of the way of a server in active use.
     last_search_ms: std::sync::atomic::AtomicU64,
+    /// Files a client told the server changed, and when their debounce window
+    /// elapses. See [`PendingChanges`].
+    pending_changes: Mutex<PendingChanges>,
     #[cfg(test)]
     stale_refresh_hook: Mutex<Option<StaleRefreshHook>>,
 }
@@ -707,6 +738,38 @@ impl ServerState {
         self.started
             .elapsed()
             .saturating_sub(Duration::from_millis(last))
+    }
+
+    /// Record client-notified paths and restart the debounce window.
+    /// Returns the total number of pending paths.
+    fn note_pending_changes(&self, paths: &[String]) -> usize {
+        let mut pending = self.pending_changes.lock().unwrap();
+        for path in paths {
+            if !pending.paths.contains(path) {
+                pending.paths.push(path.clone());
+            }
+        }
+        pending.due = Some(Instant::now() + PENDING_FLUSH_DEBOUNCE);
+        pending.paths.len()
+    }
+
+    /// Take the pending paths unconditionally, clearing the debounce window.
+    fn take_pending_changes(&self) -> Vec<String> {
+        let mut pending = self.pending_changes.lock().unwrap();
+        pending.due = None;
+        std::mem::take(&mut pending.paths)
+    }
+
+    /// Take the pending paths once the debounce window has elapsed; empty
+    /// while it is still running or the list is empty.
+    fn take_due_pending_changes(&self) -> Vec<String> {
+        let mut pending = self.pending_changes.lock().unwrap();
+        if pending.due.is_some_and(|due| due <= Instant::now()) {
+            pending.due = None;
+            std::mem::take(&mut pending.paths)
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -925,6 +988,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
         unreadable: RwLock::new(std::collections::HashMap::new()),
         started: serve_start,
         last_search_ms: std::sync::atomic::AtomicU64::new(0),
+        pending_changes: Mutex::new(PendingChanges::default()),
         #[cfg(test)]
         stale_refresh_hook: Mutex::new(None),
     });
@@ -1011,6 +1075,11 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
     // Start auto-save thread
     let save_state = Arc::clone(&state);
     thread::spawn(move || auto_save_loop(save_state));
+
+    // Reindex client-notified changes once their debounce window elapses
+    // without a new notification; searches flush the same list earlier.
+    let pending_state = Arc::clone(&state);
+    thread::spawn(move || pending_flush_loop(pending_state));
 
     // Bound how long a change the watcher never heard about can stay wrong.
     // Pointless without a watcher: `--no-watch` means the index is only ever
@@ -1412,8 +1481,52 @@ fn process_request(request: &str, state: &Arc<ServerState>) -> String {
         "files" => handle_files(id, &params, state),
         "status" => handle_status(id, state),
         "reload" => handle_reload(id, state),
+        "notify" => handle_notify(id, &params, state),
         _ => json_rpc_error(id, -32601, &format!("Method not found: {method}")),
     }
+}
+
+/// A client reports files it changed. They join the pending list and the
+/// debounce window restarts; the list is then flushed before the next search
+/// and, absent one, by the pending-flush loop once the window elapses.
+fn handle_notify(
+    id: Option<serde_json::Value>,
+    params: &serde_json::Value,
+    state: &Arc<ServerState>,
+) -> String {
+    let Some(raw_paths) = params.get("paths").and_then(|p| p.as_array()) else {
+        return json_rpc_error(id, -32602, "params.paths must be an array of index-relative paths");
+    };
+    let mut paths = Vec::with_capacity(raw_paths.len());
+    for path in raw_paths {
+        let Some(path) = path.as_str() else {
+            return json_rpc_error(id, -32602, "params.paths entries must be strings");
+        };
+        // Same shape rules as a search scope: index-relative, forward slashes.
+        if path.is_empty()
+            || path.starts_with('/')
+            || path.contains('\\')
+            || path.split('/').any(|part| matches!(part, "." | ".."))
+        {
+            return json_rpc_error(id, -32602, &format!("invalid path: {path}"));
+        }
+        paths.push(path.to_string());
+    }
+    let pending = state.note_pending_changes(&paths);
+    eprintln!(
+        "[trace] notify: {} path(s) queued, {} pending, debounce {}s",
+        paths.len(),
+        pending,
+        PENDING_FLUSH_DEBOUNCE.as_secs()
+    );
+    json_rpc_result(
+        id,
+        serde_json::json!({
+            "queued": paths.len(),
+            "pending": pending,
+            "debounce_secs": PENDING_FLUSH_DEBOUNCE.as_secs(),
+        }),
+    )
 }
 
 fn handle_files(
@@ -1742,12 +1855,17 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
 fn handle_search(
     id: Option<serde_json::Value>,
     params: &serde_json::Value,
-    state: &ServerState,
+    state: &Arc<ServerState>,
 ) -> String {
     let start = Instant::now();
     // Marks the server as in use, so the periodic reconcile waits for a gap
     // rather than walking the tree underneath a client that is mid-session.
     state.note_search();
+
+    // A client may have notified changes that are still pending: apply them
+    // now, before reading the index, so this search runs against the updated
+    // files rather than the ones they replaced.
+    flush_notified_changes(state);
 
     let req = match parse_search_params(params) {
         Ok(r) => r,
@@ -2231,6 +2349,7 @@ fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
         "hidden_complete": state.hidden_complete.load(Ordering::SeqCst) && !indexing,
         "index_progress": state.index_progress.load(std::sync::atomic::Ordering::Relaxed),
         "index_total": state.index_total.load(std::sync::atomic::Ordering::Relaxed),
+        "pending_changes": state.pending_changes.lock().unwrap().paths.len(),
     });
 
     json_rpc_result(id, result)
@@ -2375,6 +2494,75 @@ fn handle_reload(id: Option<serde_json::Value>, state: &Arc<ServerState>) -> Str
     }
     schedule_tracked_membership_correction(state, &state.root, membership_changed);
     json_rpc_result(id, serde_json::json!({"status": "reloaded"}))
+}
+
+/// Apply the notified-changes list before a query, when it is not empty.
+///
+/// The list is consumed either here or by [`pending_flush_loop`]; whichever
+/// takes it first clears the debounce window, so the other finds nothing.
+fn flush_notified_changes(state: &Arc<ServerState>) {
+    let paths = state.take_pending_changes();
+    if !paths.is_empty() {
+        flush_pending_changes(state, paths);
+    }
+}
+
+/// Reindex the files a client reported as changed.
+///
+/// Takes the same snapshot gate the watcher takes, so a commit cannot land
+/// between a publisher's snapshot and its prune, and mirrors the watcher's
+/// filtering so a path the walker would skip is left as it is. `reindex_file`
+/// reads the file fresh and drops it from the index if it is gone, so a
+/// notification that raced a delete converges rather than resurrects.
+fn flush_pending_changes(state: &Arc<ServerState>, paths: Vec<String>) {
+    // The initial build walks the tree itself; re-queue so the paths are
+    // applied once it publishes, with a fresh debounce window.
+    if state.indexing.load(Ordering::SeqCst) {
+        let mut pending = state.pending_changes.lock().unwrap();
+        for path in paths {
+            if !pending.paths.contains(&path) {
+                pending.paths.push(path);
+            }
+        }
+        pending.due = Some(Instant::now() + PENDING_FLUSH_DEBOUNCE);
+        return;
+    }
+    let _gate = state.snapshot_gate.read().unwrap();
+    let mut skipped = 0;
+    for rel_path in &paths {
+        let should_skip = {
+            let gitignore = state.gitignore.read().unwrap();
+            should_skip_watcher_path(rel_path, &state.exclude_dirs, gitignore.as_ref())
+        };
+        if should_skip {
+            skipped += 1;
+            continue;
+        }
+        let path = state.root.join(rel_path);
+        reindex_file(state, &path, rel_path, true);
+    }
+    eprintln!(
+        "[trace] pending changes: reindexed {} file(s){}",
+        paths.len() - skipped,
+        if skipped > 0 {
+            format!(", skipped {skipped} (excluded or ignored)")
+        } else {
+            String::new()
+        }
+    );
+}
+
+/// Reindex client-notified files once their debounce window elapses without a
+/// new notification. A search flushes the same list earlier, so this only
+/// does work when nobody is asking.
+fn pending_flush_loop(state: Arc<ServerState>) {
+    loop {
+        thread::sleep(PENDING_FLUSH_POLL);
+        let paths = state.take_due_pending_changes();
+        if !paths.is_empty() {
+            flush_pending_changes(&state, paths);
+        }
+    }
 }
 
 /// One final-state check for a path in a native notification burst.
@@ -9095,6 +9283,7 @@ mod tests {
             unreadable: RwLock::new(std::collections::HashMap::new()),
             started: Instant::now(),
             last_search_ms: std::sync::atomic::AtomicU64::new(0),
+            pending_changes: Mutex::new(PendingChanges::default()),
             stale_refresh_hook: Mutex::new(None),
         })
     }
